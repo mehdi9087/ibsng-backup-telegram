@@ -6,6 +6,11 @@ CONFIG_FILE="${CONFIG_FILE:-/etc/ibsng-backup-telegram.env}"
 [[ -f "$CONFIG_FILE" ]] || { echo "Config missing: $CONFIG_FILE" >&2; exit 2; }
 # This is a root-owned shell configuration, generated with printf %q.
 source "$CONFIG_FILE"
+case "${1:-}" in
+  '') ;;
+  --local) TELEGRAM_SEND=false; RETENTION_HOURS=0 ;;
+  *) echo 'Usage: ibsng-backup-telegram [--local]' >&2; exit 2 ;;
+esac
 IBSNG_CONTAINER="${IBSNG_CONTAINER:-ibsng}"
 IBSNG_DB="${IBSNG_DB:-IBSng}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/ibsng/backups/telegram}"
@@ -25,7 +30,7 @@ fi
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 exec 9>"$LOCK_FILE"
-flock -n 9 || { echo 'Another backup is running; skipped.'; exit 0; }
+flock -n 9 || { echo 'Another backup or restore is running; skipped.'; [[ "${1:-}" != --local ]] || exit 5; exit 0; }
 docker inspect -f '{{.State.Running}}' "$IBSNG_CONTAINER" 2>/dev/null | grep -qx true || { echo 'IBSng container is not running' >&2; exit 3; }
 SAFE_HOST="$(printf '%s' "$HOST_LABEL" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)"
 TS_UTC="$(date -u +%Y%m%d-%H%M%S)"
