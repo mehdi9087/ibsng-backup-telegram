@@ -2,7 +2,7 @@
 # Standalone installer. The backup program is embedded below.
 set -Eeuo pipefail
 umask 077
-VERSION=1.0.0
+VERSION=1.1.0
 CONFIG=/etc/ibsng-backup-telegram.env
 SERVICE=ibsng-backup-telegram
 BIN=/usr/local/sbin/ibsng-backup-telegram
@@ -11,6 +11,9 @@ NONINTERACTIVE=false
 RECONFIGURE=false
 SKIP_TEST=false
 CHECK=false
+DETECT_ONLY=false
+CONTAINER_OVERRIDE=''
+DATABASE_OVERRIDE=''
 EXTRACT=''
 while (($#)); do
   case "$1" in
@@ -18,8 +21,11 @@ while (($#)); do
     --reconfigure) RECONFIGURE=true ;;
     --skip-test) SKIP_TEST=true ;;
     --check) CHECK=true ;;
+    --detect) DETECT_ONLY=true ;;
+    --container) shift; CONTAINER_OVERRIDE="${1:?Specify container name}" ;;
+    --database) shift; DATABASE_OVERRIDE="${1:?Specify database name}" ;;
     --extract) shift; EXTRACT="${1:?Specify extraction directory}" ;;
-    --help|-h) echo 'Usage: bash install.sh [--non-interactive] [--reconfigure] [--skip-test] [--check] [--extract DIR]'; exit 0 ;;
+    --help|-h) echo 'Usage: bash install.sh [--non-interactive] [--reconfigure] [--skip-test] [--check] [--detect] [--container NAME] [--database NAME] [--extract DIR]'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -137,16 +143,20 @@ fi
 command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || fail 'Requires Linux with systemd.'
 command -v docker >/dev/null || fail 'Install and start your Docker-based IBSng first.'
 docker info >/dev/null 2>&1 || fail 'Docker is unavailable.'
-if [[ -f "$CONFIG" && "$RECONFIGURE" == false ]]; then
+if [[ -f "$CONFIG" && "$RECONFIGURE" == false && "$DETECT_ONLY" == false && -z "$CONTAINER_OVERRIDE" && -z "$DATABASE_OVERRIDE" ]]; then
   source "$CONFIG"
   echo 'Keeping existing configuration.'
   KEEP_CONFIG=true
 else
   KEEP_CONFIG=false
-  [[ ! -f "$CONFIG" ]] || source "$CONFIG"
+  if [[ -f "$CONFIG" && "$DETECT_ONLY" == false ]]; then source "$CONFIG"; fi
 fi
-IBSNG_CONTAINER="${IBSNG_CONTAINER:-ibsng}"
-IBSNG_DB="${IBSNG_DB:-IBSng}"
+[[ -z "$CONTAINER_OVERRIDE" ]] || IBSNG_CONTAINER="$CONTAINER_OVERRIDE"
+[[ -z "$DATABASE_OVERRIDE" ]] || IBSNG_DB="$DATABASE_OVERRIDE"
+# When moving to another container, rediscover its database unless specified.
+if [[ -n "$CONTAINER_OVERRIDE" && -z "$DATABASE_OVERRIDE" ]]; then unset IBSNG_DB; fi
+IBSNG_CONTAINER="${IBSNG_CONTAINER:-}"
+IBSNG_DB="${IBSNG_DB:-}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/ibsng/backups/telegram}"
 RETENTION_HOURS="${RETENTION_HOURS:-72}"
 INTERVAL_HOURS="${INTERVAL_HOURS:-1}"
@@ -158,11 +168,71 @@ prompt() {
   IFS= read -r value </dev/tty || fail 'Could not read input.'
   [[ -z "$value" ]] || printf -v "$variable" '%s' "$value"
 }
+# Read catalog metadata only. Do not guess from container or database names.
+discover_targets() {
+  local container database databases catalog
+  local -a containers=()
+  FOUND_CONTAINERS=()
+  FOUND_DATABASES=()
+  command -v timeout >/dev/null || fail 'Automatic detection requires coreutils (timeout).'
+  if [[ -n "$IBSNG_CONTAINER" ]]; then
+    containers=("$IBSNG_CONTAINER")
+  else
+    mapfile -t containers < <(docker ps --format '{{.Names}}')
+  fi
+  for container in "${containers[@]}"; do
+    [[ "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || continue
+    if [[ -n "$IBSNG_DB" ]]; then
+      databases="$IBSNG_DB"
+    else
+      databases=''
+      for catalog in postgres template1; do
+        if databases="$(timeout 8 docker exec -u postgres "$container" psql -X -w -d "$catalog" -Atc 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname;' 2>/dev/null)"; then break; fi
+      done
+    fi
+    while IFS= read -r database; do
+      [[ "$database" =~ ^[a-zA-Z0-9_]+$ ]] || continue
+      if timeout 8 docker exec -u postgres "$container" psql -X -w -d "$database" -Atc "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relname IN ('users','ras','admins');" 2>/dev/null | grep -qx 3; then
+        FOUND_CONTAINERS+=("$container")
+        FOUND_DATABASES+=("$database")
+      fi
+    done <<< "$databases"
+  done
+}
+if [[ -z "$IBSNG_CONTAINER" || -z "$IBSNG_DB" || "$DETECT_ONLY" == true ]]; then
+  echo 'Detecting IBSng containers and databases...'
+  discover_targets
+  if [[ "${#FOUND_CONTAINERS[@]}" -eq 1 ]]; then
+    IBSNG_CONTAINER="${FOUND_CONTAINERS[0]}"
+    IBSNG_DB="${FOUND_DATABASES[0]}"
+    echo "Auto-detected container: $IBSNG_CONTAINER; database: $IBSNG_DB"
+  elif [[ "${#FOUND_CONTAINERS[@]}" -gt 1 ]]; then
+    echo 'Multiple IBSng database candidates found:'
+    for index in "${!FOUND_CONTAINERS[@]}"; do
+      printf '  %d) %s / %s\n' "$((index + 1))" "${FOUND_CONTAINERS[$index]}" "${FOUND_DATABASES[$index]}"
+    done
+    [[ "$NONINTERACTIVE" == false && "$CHECK" == false && "$DETECT_ONLY" == false ]] || fail 'Select a target with --container NAME --database NAME.'
+    printf 'Select a number: ' >/dev/tty
+    IFS= read -r selection </dev/tty || fail 'Could not read selection.'
+    [[ "$selection" =~ ^[1-9][0-9]{0,3}$ ]] && (( selection <= ${#FOUND_CONTAINERS[@]} )) || fail 'Invalid selection.'
+    IBSNG_CONTAINER="${FOUND_CONTAINERS[$((selection - 1))]}"
+    IBSNG_DB="${FOUND_DATABASES[$((selection - 1))]}"
+  else
+    echo 'No compatible IBSng database could be detected.'
+    [[ "$NONINTERACTIVE" == false && "$CHECK" == false && "$DETECT_ONLY" == false ]] || fail 'Specify --container NAME --database NAME after checking PostgreSQL access.'
+    prompt IBSNG_CONTAINER 'Docker container'
+    prompt IBSNG_DB 'Database'
+  fi
+else
+  echo "Using configured container: $IBSNG_CONTAINER; database: $IBSNG_DB"
+fi
+if [[ "$DETECT_ONLY" == true ]]; then
+  echo 'Read-only detection completed; no installation or backup performed.'
+  exit 0
+fi
 if [[ "$KEEP_CONFIG" == false && "$NONINTERACTIVE" == false && "$CHECK" == false ]]; then
   [[ -r /dev/tty ]] || fail 'No terminal; use --non-interactive with environment variables.'
   echo 'IBSng automatic backup'
-  prompt IBSNG_CONTAINER 'Docker container'
-  prompt IBSNG_DB 'Database'
   prompt HOST_LABEL 'Server label'
   prompt BACKUP_DIR 'Local backup directory'
   prompt INTERVAL_HOURS 'Backup interval in hours'
