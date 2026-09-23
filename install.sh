@@ -160,23 +160,23 @@ prompt() {
 }
 if [[ "$KEEP_CONFIG" == false && "$NONINTERACTIVE" == false && "$CHECK" == false ]]; then
   [[ -r /dev/tty ]] || fail 'No terminal; use --non-interactive with environment variables.'
-  echo 'IBSng automatic backup / نصب بکاپ خودکار IBSng'
-  prompt IBSNG_CONTAINER 'Docker container / نام کانتینر'
-  prompt IBSNG_DB 'Database / نام دیتابیس'
-  prompt HOST_LABEL 'Server label / نام یا IP سرور'
-  prompt BACKUP_DIR 'Local backup directory / مسیر ذخیره بکاپ'
-  prompt INTERVAL_HOURS 'Backup interval in hours / فاصله بکاپ به ساعت'
-  prompt RETENTION_HOURS 'Local retention hours (0=unlimited) / نگهداری محلی'
-  prompt TELEGRAM_SEND 'Send to Telegram (true/false) / ارسال به تلگرام'
+  echo 'IBSng automatic backup'
+  prompt IBSNG_CONTAINER 'Docker container'
+  prompt IBSNG_DB 'Database'
+  prompt HOST_LABEL 'Server label'
+  prompt BACKUP_DIR 'Local backup directory'
+  prompt INTERVAL_HOURS 'Backup interval in hours'
+  prompt RETENTION_HOURS 'Local retention hours (0=unlimited)'
+  prompt TELEGRAM_SEND 'Send to Telegram (true/false)'
   if [[ "$TELEGRAM_SEND" == true ]]; then
   printf 'Telegram bot token (hidden; Enter keeps existing): ' >/dev/tty
   IFS= read -rs token </dev/tty || fail 'Could not read token.'
   printf '\n' >/dev/tty
   [[ -z "$token" ]] || TELEGRAM_BOT_TOKEN="$token"
   unset token
-  prompt TELEGRAM_CHAT_ID 'Telegram chat ID / آیدی مقصد'
+  prompt TELEGRAM_CHAT_ID 'Telegram chat ID'
   TELEGRAM_DISABLE_NOTIFICATION="${TELEGRAM_DISABLE_NOTIFICATION:-false}"
-  prompt TELEGRAM_DISABLE_NOTIFICATION 'Silent Telegram delivery (true/false) / ارسال بدون اعلان'
+  prompt TELEGRAM_DISABLE_NOTIFICATION 'Silent Telegram delivery (true/false)'
   fi
 fi
 [[ "$IBSNG_CONTAINER" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'Invalid container name.'
