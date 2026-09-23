@@ -68,9 +68,9 @@ exit "${CURL_FAIL:-0}"
     env = dict(os.environ, PATH=str(mock) + ":" + os.environ["PATH"])
     passed = 0
 
-    def run_worker(name, overrides=None, expect=0):
+    def run_worker(name, overrides=None, expect=0, arguments=None):
         global passed
-        case = root / name
+        case = root / name.replace(' ', '_')
         case.mkdir()
         config = case / "config.env"
         write(config, f'''IBSNG_CONTAINER=ibsng
@@ -93,10 +93,10 @@ RETENTION_HOURS=1
             os.utime(path, (time.time()-10000, time.time()-10000))
         command_env = dict(env, CONFIG_FILE=str(config), API_JSON='{"ok":true}')
         command_env.update(overrides or {})
-        result = subprocess.run(["bash", str(HERE / "backup.sh")], env=command_env, capture_output=True, text=True)
+        result = subprocess.run(["bash", str(HERE / "backup.sh")] + (arguments or []), env=command_env, capture_output=True, text=True)
         assert result.returncode == expect, (name, result.stdout, result.stderr)
         assert unrelated.exists(), name
-        assert old.exists() == (expect != 0), name
+        assert old.exists() == (expect != 0 or bool(arguments)), name
         dumps = [p for p in backups.glob("*.sql.gz") if p not in (old, unrelated)]
         if expect == 9:
             assert not dumps, name
@@ -118,6 +118,7 @@ RETENTION_HOURS=1
     run_worker("http_error", {"API_STATUS": "500"}, 4)
     run_worker("network_error", {"CURL_FAIL": "28"}, 4)
     run_worker("invalid_json", {"API_JSON": 'not-json'}, 4)
+    run_worker("local backup skips Telegram and pruning", {"CURL_FAIL": "28"}, arguments=["--local"])
 
     # Rewrite paths in a test-only copy to avoid touching the host installation.
     sandbox = root / "installation"
@@ -125,7 +126,7 @@ RETENTION_HOURS=1
     (sandbox / "usr/local/sbin").mkdir(parents=True)
     (sandbox / "var/backups").mkdir(parents=True)
     installer = (HERE / "install.sh").read_text()
-    for path in ("/etc/ibsng-backup-telegram.env", "/etc/systemd/system", "/usr/local/sbin/ibsng-backup-telegram", "/var/backups/ibsng-backup-installer-"):
+    for path in ("/etc/ibsng-backup-telegram.env", "/etc/systemd/system", "/usr/local/sbin/ibsng-backup-telegram", "/usr/local/bin/ibsng-backup", "/usr/local/lib/ibsng-backup/install.sh", "/var/backups/ibsng-backup-installer-", "/var/backups/ibsng-backup-uninstall-"):
         installer = installer.replace(path, str(sandbox) + path)
     installer = installer.replace('[[ -d /run/systemd/system ]]', '[[ -d /tmp ]]')
     installer = installer.replace('[[ "$EUID" -eq 0 ]]', 'true')
@@ -150,20 +151,24 @@ esac
     config = sandbox / "etc/ibsng-backup-telegram.env"
     timer = sandbox / "etc/systemd/system/ibsng-backup-telegram.timer"
     binary = sandbox / "usr/local/sbin/ibsng-backup-telegram"
+    manager = sandbox / "usr/local/bin/ibsng-backup"
+    offline = sandbox / "usr/local/lib/ibsng-backup/install.sh"
     assert config.stat().st_mode & 0o777 == 0o600
     assert binary.stat().st_mode & 0o777 == 0o700
+    assert manager.stat().st_mode & 0o777 == 0o700
+    assert offline.stat().st_mode & 0o777 == 0o700
     assert 'IBSNG_CONTAINER=billing-db' in config.read_text()
     assert 'IBSNG_DB=billing' in config.read_text()
     print("PASS: fresh installation and file permissions")
     passed += 1
     timer.write_text(timer.read_text() + "# existing custom schedule marker\n")
-    prior = {p: p.read_bytes() for p in (config, timer, binary)}
+    prior = {p: p.read_bytes() for p in (config, timer, binary, manager, offline)}
     install()
     assert all(p.read_bytes() == data for p, data in prior.items())
     print("PASS: reinstall preserves config and timer")
     passed += 1
     binary.write_text("#!/bin/bash\n# previous working version\n")
-    prior = {p: p.read_bytes() for p in (config, timer, binary)}
+    prior = {p: p.read_bytes() for p in (config, timer, binary, manager, offline)}
     install({"START_FAIL": "1"}, expect=1)
     assert all(p.read_bytes() == data for p, data in prior.items())
     assert (root / "timer-enabled").exists()
@@ -188,4 +193,23 @@ esac
     detect("ambiguous databases require selection", "multiple", expected=1, contains="Multiple IBSng")
     detect("explicit selection resolves ambiguity", "multiple", ["--container", "second-db", "--database", "IBSng"], contains="Auto-detected container: second-db; database: IBSng")
     detect("fallback maintenance database", "fallback", contains="Auto-detected container: billing-db; database: billing")
+    install()
+    (root / "timer-enabled").unlink()
+    install()
+    assert not (root / "timer-enabled").exists()
+    print("PASS: upgrade keeps a disabled timer disabled")
+    passed += 1
+    result = subprocess.run(["bash", str(manager), "schedule", "30m"], env=installer_env, capture_output=True, text=True)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'OnUnitActiveSec=30m' in timer.read_text()
+    assert 'BACKUP_INTERVAL=30m' in config.read_text()
+    assert not (root / "timer-enabled").exists()
+    print("PASS: offline schedule change preserves disabled state")
+    passed += 1
+    result = subprocess.run(["bash", str(HERE / "install.sh"), "--extract", str(root / "extracted")], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    for filename in ("backup.sh", "manager.sh"):
+        assert (root / "extracted" / filename).read_text() == (HERE / filename).read_text()
+    print("PASS: embedded programs match standalone sources")
+    passed += 1
     print(f"All {passed} integration tests passed.")
