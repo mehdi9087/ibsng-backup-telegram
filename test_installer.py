@@ -27,6 +27,7 @@ with tempfile.TemporaryDirectory(prefix="ibsng-tests-") as temporary:
     write(mock / "docker", '''#!/bin/bash
 case "$1" in
   info) exit 0 ;;
+  ps) printf 'billing-db\\nweb-app\\nsecond-db\\n' ;;
   inspect) echo true ;;
   exec)
     if [[ "$5" == pg_dump ]]; then
@@ -34,8 +35,24 @@ case "$1" in
       echo '-- PostgreSQL database dump'
       [[ "${DUMP_FAIL:-0}" == 0 ]] || exit 9
       echo 'CREATE TABLE users (id integer);'
-    elif [[ "${9:-}" == 'SELECT 1' ]]; then echo 1
-    else printf 'users=1\\nras=1\\nadmins=1\\n'; fi ;;
+    else
+      query="${!#}"
+      container="$4"
+      database=''
+      while (($#)); do
+        if [[ "$1" == -d ]]; then database="$2"; break; fi
+        shift
+      done
+      if [[ "$query" == *'FROM pg_database'* ]]; then
+        [[ "${DETECT_SCENARIO:-}" != fallback || "$database" != postgres ]] || exit 1
+        printf 'postgres\\nIBSng\\nbilling\\n'
+      elif [[ "$query" == *'pg_catalog.pg_class'* ]]; then
+        if [[ "${DETECT_SCENARIO:-}" != none && "$container" == billing-db && "$database" == billing ]]; then echo 3
+        elif [[ "${DETECT_SCENARIO:-}" == multiple && "$container" == second-db && "$database" == IBSng ]]; then echo 3
+        else echo 0; fi
+      elif [[ "$query" == 'SELECT 1' ]]; then echo 1
+      else printf 'users=1\\nras=1\\nadmins=1\\n'; fi
+    fi ;;
 esac
 ''')
     write(mock / "curl", '''#!/bin/bash
@@ -135,6 +152,8 @@ esac
     binary = sandbox / "usr/local/sbin/ibsng-backup-telegram"
     assert config.stat().st_mode & 0o777 == 0o600
     assert binary.stat().st_mode & 0o777 == 0o700
+    assert 'IBSNG_CONTAINER=billing-db' in config.read_text()
+    assert 'IBSNG_DB=billing' in config.read_text()
     print("PASS: fresh installation and file permissions")
     passed += 1
     timer.write_text(timer.read_text() + "# existing custom schedule marker\n")
@@ -150,4 +169,23 @@ esac
     assert (root / "timer-enabled").exists()
     print("PASS: failed initial backup restores prior installation")
     passed += 1
+
+    def detect(name, scenario, arguments=None, expected=0, contains=None):
+        global passed
+        result = subprocess.run(
+            ["bash", str(root / "install-test.sh"), "--detect", "--non-interactive"] + (arguments or []),
+            env=dict(installer_env, DETECT_SCENARIO=scenario), capture_output=True, text=True,
+        )
+        assert (result.returncode == 0) == (expected == 0), (name, result.stdout, result.stderr)
+        if contains:
+            assert contains in result.stdout + result.stderr, (name, result.stdout, result.stderr)
+        assert all(p.read_bytes() == data for p, data in prior.items()), name
+        passed += 1
+        print("PASS:", name)
+
+    detect("renamed container and database", "unique", contains="Auto-detected container: billing-db; database: billing")
+    detect("ignore database name without IBSng schema", "none", expected=1, contains="No compatible IBSng")
+    detect("ambiguous databases require selection", "multiple", expected=1, contains="Multiple IBSng")
+    detect("explicit selection resolves ambiguity", "multiple", ["--container", "second-db", "--database", "IBSng"], contains="Auto-detected container: second-db; database: IBSng")
+    detect("fallback maintenance database", "fallback", contains="Auto-detected container: billing-db; database: billing")
     print(f"All {passed} integration tests passed.")
