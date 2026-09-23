@@ -1,0 +1,7 @@
+*.sql
+*.sql.gz
+*.meta
+*.response
+*.env
+!config.example.env
+__pycache__/
