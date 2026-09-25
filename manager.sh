@@ -2,7 +2,7 @@
 # Interactive and command-line management for IBSng database backups.
 set -Eeuo pipefail
 umask 077
-VERSION=1.2.1
+VERSION=1.2.2
 CONFIG=/etc/ibsng-backup-telegram.env
 WORKER=/usr/local/sbin/ibsng-backup-telegram
 INSTALLER=/usr/local/lib/ibsng-backup/install.sh
@@ -26,7 +26,7 @@ Usage: ibsng-backup [COMMAND]
   enable | disable             Enable or disable automatic backups
   logs [LINES]                 Show recent service logs (default: 50)
   update                       Download and install the latest manager version
-  uninstall                    Remove service and settings; keep backup files
+  uninstall                    Remove service, settings and local backup files
   version                      Print the installed version
   help                         Show this help
 EOF
@@ -118,24 +118,51 @@ restore_database() (
   echo "Restore completed into '$target'. The configured application database remains '$IBSNG_DB'."
   echo 'Review the restored data before manually changing the IBSng application configuration.'
 )
+purge_backup_files() {
+  python3 - "$BACKUP_DIR" "$1" <<'PY'
+import pathlib, sys
+directory = pathlib.Path(sys.argv[1])
+if not directory.is_absolute() or directory.resolve() == pathlib.Path('/') or directory.is_symlink():
+    sys.exit('ERROR: Refusing unsafe or symlinked backup directory.')
+if not directory.exists():
+    print('No local backup directory to remove.')
+    sys.exit(0)
+if not directory.is_dir():
+    sys.exit('ERROR: Backup path is not a directory.')
+files = [p for p in directory.iterdir()
+         if (p.is_file() or p.is_symlink()) and
+         (p.name.endswith(('.sql.gz', '.sql.gz.meta')) or
+          p.name.startswith(('.ibsng-dump.', '.telegram-response.')))]
+if sys.argv[2] == 'preview':
+    print(f'Permanently delete {len(files)} local backup/metadata files in: {directory}')
+else:
+    for path in files:
+        path.unlink()
+    if not any(directory.iterdir()):
+        directory.rmdir()
+    print(f'Deleted {len(files)} local backup/metadata files. Unrelated files were preserved.')
+PY
+}
 uninstall_tools() (
   local state archive
   state="$(systemctl show "$SERVICE.service" -p ActiveState --value)" || return 1
   case "$state" in active|activating|deactivating) fail 'A backup is running; retry after it finishes.'; return 1 ;; esac
   echo 'This removes the backup commands, timer and settings, including saved configuration copies.'
-  echo 'Database backup files are kept. Telegram credentials must be entered again after reinstalling.'
+  purge_backup_files preview || return 1
+  echo 'Local backups will be permanently deleted. The live IBSng database and Telegram messages are not deleted.'
   confirm UNINSTALL || return 1
   exec 9>"$LOCK_FILE"
   flock -n 9 || { fail 'Another backup or restore is running.'; return 1; }
   systemctl disable --now "$SERVICE.timer" || return 1
-  # Remove only this installer's configuration copies, never database backups.
+  purge_backup_files delete || return 1
+  # Remove this installer's saved configuration copies as well.
   for archive in "$SNAPSHOT_ROOT"/ibsng-backup-{installer,uninstall}-*; do
     [[ -d "$archive" && ! -L "$archive" ]] || continue
     rm -f -- "$archive$CONFIG" || return 1
   done
   rm -f -- "$CONFIG" "$WORKER" "$MANAGER" "$INSTALLER" "$UNITS/$SERVICE.service" "$UNITS/$SERVICE.timer" || return 1
   systemctl daemon-reload || return 1
-  echo "Service and settings removed. Database backup files kept in: $BACKUP_DIR"
+  echo 'Service, settings and local backup files removed. The live IBSng database was not changed.'
 )
 update_tools() (
   local temporary
@@ -193,7 +220,7 @@ IBSng Backup Manager
  10) Disable automatic backups
  11) View recent logs
  12) Update backup tools
- 13) Uninstall service and settings (keep backup files)
+ 13) Uninstall service, settings and local backups
   0) Exit
 EOF
   read_input choice 'Select an option' || exit 1
