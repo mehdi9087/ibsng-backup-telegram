@@ -114,7 +114,7 @@ fi
         passed += 1
         print('PASS:', name)
 
-    assert '1.2.1' in run(['version'])
+    assert '1.2.2' in run(['version'])
     assert 'SECRET_TEST_VALUE' not in run(['status'])
     passed_test('version and status hide token')
     run(['disable'])
@@ -164,13 +164,37 @@ fi
     assert manager.exists()
     run(['uninstall'], ok=False, confirmation='NO')
     assert manager.exists() and not list(snapshots.iterdir())
+    assert valid.exists()
     passed_test('uninstall refuses active backup and requires exact confirmation')
     with open(root / 'lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         run(['uninstall'], ok=False, confirmation='UNINSTALL')
     assert manager.exists()
+    assert valid.exists()
     passed_test('uninstall refuses an active maintenance lock')
-    prior_backup = valid.read_bytes()
+    original_config = config.read_text()
+    write(config, original_config.replace(str(backups), '/'))
+    run(['uninstall'], ok=False)
+    link = root / 'linked-backups'
+    link.symlink_to(backups, target_is_directory=True)
+    write(config, original_config.replace(str(backups), str(link)))
+    run(['uninstall'], ok=False)
+    write(config, original_config)
+    assert manager.exists() and valid.exists()
+    passed_test('uninstall rejects root and symlinked backup directories')
+    meta.write_text('test metadata')
+    partial = backups / '.ibsng-dump.test'
+    partial.write_text('partial backup')
+    unrelated_backup_file = backups / 'notes.txt'
+    unrelated_backup_file.write_text('keep this note')
+    external = root / 'external.sql.gz'
+    external.write_bytes(b'external data')
+    backup_link = backups / 'linked.sql.gz'
+    backup_link.symlink_to(external)
+    nested = backups / 'unrelated-directory'
+    nested.mkdir()
+    (nested / 'data.sql.gz').write_bytes(b'nested data')
+    prior_docker_log = (root / 'docker.log').read_bytes()
     archived_configs = []
     for prefix in ('installer', 'uninstall'):
         archived = Path(str(snapshots / ('ibsng-backup-' + prefix + '-test')) + str(config))
@@ -181,8 +205,13 @@ fi
     run(['uninstall'], confirmation='UNINSTALL')
     assert not manager.exists() and not worker.exists() and not offline.exists()
     assert not list(units.iterdir()) and not (root / 'timer').exists()
-    assert not config.exists() and valid.read_bytes() == prior_backup
+    assert not config.exists() and not valid.exists() and not broken.exists()
+    assert not meta.exists() and not partial.exists() and not backup_link.is_symlink()
+    assert unrelated_backup_file.read_text() == 'keep this note'
+    assert external.read_bytes() == b'external data'
+    assert (nested / 'data.sql.gz').read_bytes() == b'nested data'
+    assert (root / 'docker.log').read_bytes() == prior_docker_log
     assert all(not p.exists() for p in archived_configs)
     assert unrelated.read_text() == 'unrelated settings'
-    passed_test('uninstall removes tools and settings including saved copies, keeps backups and unrelated files')
+    passed_test('uninstall removes tools, settings and local backups without touching the live database or unrelated files')
     print(f'All {passed} management tests passed.')
