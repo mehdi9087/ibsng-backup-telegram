@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix="ibsng-manager-tests-") as temporary:
         '/usr/local/lib/ibsng-backup/install.sh': offline,
         '/usr/local/bin/ibsng-backup': manager,
         '/etc/systemd/system': units,
-        '/var/backups/ibsng-backup-uninstall-': str(snapshots) + '/saved-',
+        '/var/backups': snapshots,
     }.items():
         source = source.replace(old, str(new))
     source = source.replace('[[ "$EUID" -eq 0 ]]', 'true')
@@ -114,7 +114,7 @@ fi
         passed += 1
         print('PASS:', name)
 
-    assert '1.2.0' in run(['version'])
+    assert '1.2.1' in run(['version'])
     assert 'SECRET_TEST_VALUE' not in run(['status'])
     passed_test('version and status hide token')
     run(['disable'])
@@ -170,12 +170,19 @@ fi
         run(['uninstall'], ok=False, confirmation='UNINSTALL')
     assert manager.exists()
     passed_test('uninstall refuses an active maintenance lock')
-    prior_config, prior_backup = config.read_bytes(), valid.read_bytes()
+    prior_backup = valid.read_bytes()
+    archived_configs = []
+    for prefix in ('installer', 'uninstall'):
+        archived = Path(str(snapshots / ('ibsng-backup-' + prefix + '-test')) + str(config))
+        write(archived, config.read_text())
+        archived_configs.append(archived)
+    unrelated = snapshots / 'unrelated.env'
+    write(unrelated, 'unrelated settings')
     run(['uninstall'], confirmation='UNINSTALL')
     assert not manager.exists() and not worker.exists() and not offline.exists()
     assert not list(units.iterdir()) and not (root / 'timer').exists()
-    assert config.read_bytes() == prior_config and valid.read_bytes() == prior_backup
-    assert len(list(snapshots.iterdir())) == 1
-    assert any(p.name == 'config.env' for p in snapshots.rglob('*'))
-    passed_test('uninstall removes tools, saves snapshot and keeps config and backups')
+    assert not config.exists() and valid.read_bytes() == prior_backup
+    assert all(not p.exists() for p in archived_configs)
+    assert unrelated.read_text() == 'unrelated settings'
+    passed_test('uninstall removes tools and settings including saved copies, keeps backups and unrelated files')
     print(f'All {passed} management tests passed.')
