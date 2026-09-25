@@ -2,13 +2,14 @@
 # Interactive and command-line management for IBSng database backups.
 set -Eeuo pipefail
 umask 077
-VERSION=1.2.0
+VERSION=1.2.1
 CONFIG=/etc/ibsng-backup-telegram.env
 WORKER=/usr/local/sbin/ibsng-backup-telegram
 INSTALLER=/usr/local/lib/ibsng-backup/install.sh
 MANAGER=/usr/local/bin/ibsng-backup
 SERVICE=ibsng-backup-telegram
 UNITS=/etc/systemd/system
+SNAPSHOT_ROOT=/var/backups
 fail() { echo "ERROR: $*" >&2; return 1; }
 usage() {
   cat <<'EOF'
@@ -25,7 +26,7 @@ Usage: ibsng-backup [COMMAND]
   enable | disable             Enable or disable automatic backups
   logs [LINES]                 Show recent service logs (default: 50)
   update                       Download and install the latest manager version
-  uninstall                    Remove service tools; keep config and backups
+  uninstall                    Remove service and settings; keep backup files
   version                      Print the installed version
   help                         Show this help
 EOF
@@ -118,21 +119,23 @@ restore_database() (
   echo 'Review the restored data before manually changing the IBSng application configuration.'
 )
 uninstall_tools() (
-  local state snapshot
+  local state archive
   state="$(systemctl show "$SERVICE.service" -p ActiveState --value)" || return 1
   case "$state" in active|activating|deactivating) fail 'A backup is running; retry after it finishes.'; return 1 ;; esac
-  echo 'This removes the backup commands and timer. Configuration and database backups are kept.'
+  echo 'This removes the backup commands, timer and settings, including saved configuration copies.'
+  echo 'Database backup files are kept. Telegram credentials must be entered again after reinstalling.'
   confirm UNINSTALL || return 1
   exec 9>"$LOCK_FILE"
   flock -n 9 || { fail 'Another backup or restore is running.'; return 1; }
-  snapshot="$(mktemp -d /var/backups/ibsng-backup-uninstall-XXXXXXXX)" || return 1
-  for path in "$CONFIG" "$WORKER" "$MANAGER" "$INSTALLER" "$UNITS/$SERVICE.service" "$UNITS/$SERVICE.timer"; do
-    [[ ! -f "$path" ]] || cp -a --parents "$path" "$snapshot/" || return 1
-  done
   systemctl disable --now "$SERVICE.timer" || return 1
-  rm -f -- "$WORKER" "$MANAGER" "$INSTALLER" "$UNITS/$SERVICE.service" "$UNITS/$SERVICE.timer" || return 1
+  # Remove only this installer's configuration copies, never database backups.
+  for archive in "$SNAPSHOT_ROOT"/ibsng-backup-{installer,uninstall}-*; do
+    [[ -d "$archive" && ! -L "$archive" ]] || continue
+    rm -f -- "$archive$CONFIG" || return 1
+  done
+  rm -f -- "$CONFIG" "$WORKER" "$MANAGER" "$INSTALLER" "$UNITS/$SERVICE.service" "$UNITS/$SERVICE.timer" || return 1
   systemctl daemon-reload || return 1
-  echo "Removed tools. Configuration: $CONFIG; backups: $BACKUP_DIR; saved installation: $snapshot"
+  echo "Service and settings removed. Database backup files kept in: $BACKUP_DIR"
 )
 update_tools() (
   local temporary
@@ -190,7 +193,7 @@ IBSng Backup Manager
  10) Disable automatic backups
  11) View recent logs
  12) Update backup tools
- 13) Uninstall backup tools (keep data)
+ 13) Uninstall service and settings (keep backup files)
   0) Exit
 EOF
   read_input choice 'Select an option' || exit 1
